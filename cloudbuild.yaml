@@ -1,0 +1,35 @@
+substitutions:
+  _REGION: asia-southeast2
+  _SERVICE: csv-analyzer-api
+  _REPO: app-images
+  _IMAGE: csv-analyzer
+  _PROJECT_ID: $PROJECT_ID
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+- name: gcr.io/cloud-builders/docker
+  args: ["build", "-t", "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA", "."]
+
+- name: gcr.io/cloud-builders/docker
+  args: ["push", "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA"]
+
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  entrypoint: gcloud
+  args:
+    [
+      "run","deploy","${_SERVICE}",
+      "--image","${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA",
+      "--region","${_REGION}",
+      "--platform","managed",
+      "--allow-unauthenticated",
+      "--memory","2Gi",
+      "--cpu","1",
+      "--port","8080",
+      "--set-env-vars","GCS_BUCKET=${_SERVICE}-bucket",
+      "--set-env-vars","FIRESTORE_COLLECTION=tasks"
+    ]
+
+images:
+- "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA"

@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <title>CSV Analyzer (FastAPI + Cloud Run)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 1rem 1.2rem; margin-top: 1rem; }
+    .row { display: grid; gap: 12px; grid-template-columns: 1fr; }
+    label { font-weight: 600; }
+    input, textarea, button { font-size: 1rem; padding: .6rem .8rem; }
+    button { cursor: pointer; border-radius: 10px; border: 1px solid #111827; background: #111827; color: white; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .status { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    img { max-width: 100%; border-radius: 8px; border: 1px solid #e5e7eb; }
+    .muted { color: #6b7280; }
+    progress { width: 100%; height: 12px; }
+  </style>
+</head>
+<body>
+  <h1>CSV Analyzer</h1>
+  <p class="muted">Upload CSV & pertanyaan. &lt; 30MB: multipart, &ge; 30MB: upload langsung ke GCS (resumable). Hasil bisa stream realtime (SSE).</p>
+
+  <div class="card">
+    <form id="qform">
+      <div class="row">
+        <div>
+          <label for="file">CSV file</label><br>
+          <input type="file" id="file" name="file" accept=".csv" required>
+          <div class="muted" style="margin-top:6px;">Tip: &lt; 30MB dikirim langsung; &ge; 30MB diunggah ke GCS dulu.</div>
+        </div>
+        <div>
+          <label for="prompt">Pertanyaan</label><br>
+          <textarea id="prompt" name="user_prompt" rows="4" placeholder="Contoh: faktor apa yang paling berkontribusi pada turunnya revenue bulan ini?" required></textarea>
+        </div>
+        <div>
+          <label><input type="checkbox" id="streamToggle" checked> Stream teks realtime (SSE)</label>
+        </div>
+        <div>
+          <button id="submitBtn" type="submit">Kirim</button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  <div id="statusCard" class="card" style="display:none;">
+    <div>Status: <span id="status" class="status">-</span></div>
+    <div id="progressWrap" style="display:none; margin-top:8px;">
+      <progress id="prog" max="100" value="0"></progress>
+      <div id="progText" class="muted"></div>
+    </div>
+    <div id="resultWrap" style="display:none; margin-top: 10px;">
+      <h3>Hasil Analisis</h3>
+      <div id="result" style="white-space: pre-wrap;"></div>
+      <div id="chartWrap" style="margin-top: 12px; display:none;">
+        <h3>Visualisasi</h3>
+        <img id="chartImg" src="" alt="chart">
+      </div>
+    </div>
+  </div>
+
+<script>
+const API_BASE = "/api/v1";
+const DIRECT_LIMIT_MB = 30;
+
+const form = document.getElementById('qform');
+const submitBtn = document.getElementById('submitBtn');
+const statusCard = document.getElementById('statusCard');
+const statusEl = document.getElementById('status');
+const resultWrap = document.getElementById('resultWrap');
+const resultEl  = document.getElementById('result');
+const chartWrap = document.getElementById('chartWrap');
+const chartImg  = document.getElementById('chartImg');
+const progressWrap = document.getElementById('progressWrap');
+const prog = document.getElementById('prog');
+const progText = document.getElementById('progText');
+const streamToggle = document.getElementById('streamToggle');
+
+let pollTimer = null; let es = null;
+
+function startPolling(task_id){
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    try {
+      const sres = await fetch(`${API_BASE}/status/${task_id}`);
+      if (!sres.ok) return;
+      const data = await sres.json();
+      statusEl.textContent = data.status;
+
+      if (data.partial_result) {
+        resultWrap.style.display = 'block';
+        resultEl.textContent = data.partial_result;
+      }
+
+      if (data.status === 'completed') {
+        clearInterval(pollTimer); pollTimer = null;
+        resultWrap.style.display = 'block';
+        resultEl.textContent = data.result || data.partial_result || '(kosong)';
+        if (data.chart_url) { chartWrap.style.display = 'block'; chartImg.src = data.chart_url; }
+      } else if (data.status === 'failed') {
+        clearInterval(pollTimer); pollTimer = null;
+        resultWrap.style.display = 'block';
+        resultEl.textContent = "Gagal: " + (data.error || 'unknown error');
+      }
+    } catch {}
+  }, 3000);
+}
+
+function startSSE(task_id){
+  try {
+    if (es) { es.close(); es = null; }
+    es = new EventSource(`${API_BASE}/status/stream/${task_id}`);
+
+    es.addEventListener('status', (ev) => {
+      const d = JSON.parse(ev.data); statusEl.textContent = d.status;
+    });
+    es.addEventListener('partial', (ev) => {
+      const d = JSON.parse(ev.data); resultWrap.style.display = 'block'; resultEl.textContent = d.text ?? '';
+    });
+    es.addEventListener('completed', (ev) => {
+      const d = JSON.parse(ev.data);
+      statusEl.textContent = 'completed'; resultWrap.style.display = 'block'; resultEl.textContent = d.result || '(kosong)';
+      if (d.chart_url) { chartWrap.style.display = 'block'; chartImg.src = d.chart_url; }
+      es.close(); es = null;
+    });
+    es.addEventListener('failed', (ev) => {
+      const d = JSON.parse(ev.data);
+      statusEl.textContent = 'failed'; resultWrap.style.display = 'block'; resultEl.textContent = "Gagal: " + (d.error || 'unknown error');
+      es.close(); es = null;
+    });
+    es.onerror = () => { if (es) { es.close(); es = null; } startPolling(task_id); };
+  } catch { startPolling(task_id); }
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (es) { es.close(); es = null; }
+
+  const file = document.getElementById('file').files[0];
+  const prompt = document.getElementById('prompt').value;
+  const wantStream = streamToggle.checked;
+
+  if (!file) { alert('Pilih file CSV'); return; }
+  if (!prompt.trim()) { alert('Isi pertanyaan'); return; }
+
+  submitBtn.disabled = true;
+  statusCard.style.display = 'block';
+  resultWrap.style.display = 'none';
+  chartWrap.style.display = 'none';
+  progressWrap.style.display = 'none';
+  resultEl.textContent = '';
+  statusEl.textContent = 'Menyiapkan...';
+
+  try {
+    let task_id;
+
+    if (file.size < DIRECT_LIMIT_MB * 1024 * 1024) {
+      // multipart langsung
+      statusEl.textContent = 'Mengunggah (langsung)...';
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('user_prompt', prompt);
+      fd.append('stream', wantStream ? 'true' : 'false');
+      const res = await fetch(`${API_BASE}/data/query`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(await res.text());
+      ({ task_id } = await res.json());
+    } else {
+      // resumable upload → GCS
+      statusEl.textContent = 'Membuat sesi upload...';
+      const meta = new FormData();
+      meta.append('filename', file.name);
+      meta.append('content_type', file.type || 'text/csv');
+      const mres = await fetch(`${API_BASE}/uploads/session`, { method: 'POST', body: meta });
+      if (!mres.ok) throw new Error(await mres.text());
+      const { upload_url, gcs_uri } = await mres.json();
+
+      statusEl.textContent = 'Mengunggah ke GCS (resumable)...';
+      progressWrap.style.display = 'block';
+      await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', upload_url, true);
+        xhr.setRequestHeader('Content-Type', file.type || 'text/csv');
+        xhr.upload.onprogress = (evt) => {
+          if (evt.lengthComputable) {
+            const pct = Math.round((evt.loaded / evt.total) * 100);
+            prog.value = pct;
+            progText.textContent = `${pct}% (${(evt.loaded/1024/1024).toFixed(1)} / ${(evt.total/1024/1024).toFixed(1)} MB)`;
+          }
+        };
+        xhr.onload = () => (xhr.status >= 200 && xhr.status < 300) ? resolve() : reject(new Error('Upload gagal: ' + xhr.status));
+        xhr.onerror = () => reject(new Error('Network error saat upload'));
+        xhr.send(file);
+      });
+
+      statusEl.textContent = 'Memulai analisis...';
+      const fd = new FormData();
+      fd.append('user_prompt', prompt);
+      fd.append('gcs_uri', gcs_uri);
+      fd.append('stream', wantStream ? 'true' : 'false');
+      const res = await fetch(`${API_BASE}/data/query`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(await res.text());
+      ({ task_id } = await res.json());
+    }
+
+    statusEl.textContent = 'Queued...';
+    startSSE(task_id);
+
+  } catch (err) {
+    alert('Error: ' + err.message);
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
