@@ -24,11 +24,14 @@ steps:
       "--region","${_REGION}",
       "--platform","managed",
       "--allow-unauthenticated",
-      "--memory","2Gi",
-      "--cpu","1",
+      "--memory","8Gi",
+      "--cpu","2",
+      "--no-cpu-throttling",        # <--- tambahkan ini
+      "--concurrency","40",
+      "--timeout","900",
+      "--min-instances","1",
       "--port","8080",
-      "--set-env-vars","GCS_BUCKET=${_SERVICE}-bucket",
-      "--set-env-vars","FIRESTORE_COLLECTION=tasks"
+      "--set-env-vars","GCS_BUCKET=${_SERVICE}-bucket,FIRESTORE_COLLECTION=tasks"
     ]
 
 images:
