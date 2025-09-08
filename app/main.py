@@ -34,11 +34,12 @@ def _sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
 def _truthy(v: Optional[str]) -> bool:
-    if v is None: return False
-    return str(v).strip().lower() in {"1","true","yes","on"}
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
 
 def _sse_event(event: str, data: dict | str) -> str:
-    payload = json.dumps(data, ensure_ascii=False) if isinstance(data,(dict,list)) else str(data)
+    payload = json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data)
     return f"event: {event}\ndata: {payload}\n\n"
 
 def _sse_comment(msg: str) -> str:
@@ -52,7 +53,7 @@ def health():
 # ---------- Frontpage ----------
 @app.get("/", response_class=HTMLResponse)
 def index():
-    with open("static/index.html","r",encoding="utf-8") as f:
+    with open("static/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
 # ---------- Resumable Upload Session ----------
@@ -74,7 +75,7 @@ async def start_query(
     file: UploadFile | None = File(None),
     user_prompt: str = Form(...),
     gcs_uri: Optional[str] = Form(None),
-    stream: Optional[str] = Form(None),   # toggle per-job
+    stream: Optional[str] = Form(None),  # toggle per-job
 ):
     if not settings.GCS_BUCKET:
         raise HTTPException(500, "GCS_BUCKET not configured")
@@ -91,7 +92,9 @@ async def start_query(
                     raise HTTPException(413, f"File too large (> {settings.MAX_UPLOAD_MB} MB)")
             except ValueError:
                 pass
-        file.file.seek(0,2); size = file.file.tell(); file.file.seek(0)
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
         if size > settings.MAX_UPLOAD_MB * 1024 * 1024:
             raise HTTPException(413, f"File too large (> {settings.MAX_UPLOAD_MB} MB)")
 
@@ -105,7 +108,7 @@ async def start_query(
     else:
         if not gcs_uri.startswith("gs://"):
             raise HTTPException(400, "Invalid gcs_uri")
-        bucket, path = gcs_uri[5:].split("/",1)
+        bucket, path = gcs_uri[5:].split("/", 1)
         if bucket != settings.GCS_BUCKET:
             raise HTTPException(400, "gcs_uri bucket mismatch")
         src_blob_path = path
@@ -113,14 +116,18 @@ async def start_query(
 
     stream_compiler = settings.STREAM_COMPILER if stream is None else _truthy(stream)
 
-    fstore.init_task(settings.FIRESTORE_COLLECTION, task_id, {
-        "user_prompt": user_prompt,
-        "gcs_uri": stored_gcs_uri,
-        "chart_url": None,
-        "result": None,
-        "partial_result": "" if stream_compiler else None,
-        "stream": stream_compiler,
-    })
+    fstore.init_task(
+        settings.FIRESTORE_COLLECTION,
+        task_id,
+        {
+            "user_prompt": user_prompt,
+            "gcs_uri": stored_gcs_uri,
+            "chart_url": None,
+            "result": None,
+            "partial_result": "" if stream_compiler else None,
+            "stream": stream_compiler,
+        },
+    )
 
     background_tasks.add_task(process_task, task_id, user_prompt, src_blob_path, stream_compiler)
     return JSONResponse({"task_id": task_id, "status": "queued"})
@@ -151,12 +158,15 @@ def stream_status(task_id: str):
         last_sent_status = None
         last_partial = None
         last_keepalive = time.time()
+        # percepat polling tanpa mengubah .env
+        POLL = max(0.10, min(0.25, settings.SSE_POLL_INTERVAL_SEC))
         while True:
             data = fstore.get_task(settings.FIRESTORE_COLLECTION, task_id)
             now = time.time()
 
             if not data:
-                yield _sse_event("error", {"error":"task not found"}); return
+                yield _sse_event("error", {"error": "task not found"})
+                return
 
             status = data.get("status")
             partial = data.get("partial_result")
@@ -172,15 +182,17 @@ def stream_status(task_id: str):
                 yield _sse_event("partial", {"text": partial})
 
             if status == "completed":
-                yield _sse_event("completed", {"status":status,"result":result,"chart_url":chart_url}); return
+                yield _sse_event("completed", {"status": status, "result": result, "chart_url": chart_url})
+                return
             if status == "failed":
-                yield _sse_event("failed", {"status":status,"error":data.get("error")}); return
+                yield _sse_event("failed", {"status": status, "error": data.get("error")})
+                return
 
             if now - last_keepalive >= settings.SSE_KEEPALIVE_SEC:
                 last_keepalive = now
                 yield _sse_comment("keepalive")
 
-            time.sleep(settings.SSE_POLL_INTERVAL_SEC)
+            time.sleep(POLL)
 
     return StreamingResponse(event_gen(), media_type="text/event-stream; charset=utf-8")
 
@@ -194,31 +206,61 @@ def process_task(task_id: str, user_prompt: str, csv_blob_path: str, stream_comp
         charts_dir = Path(settings.CHARTS_DIR)
 
         if stream_compiler:
-            partial_buf = []
+            partial_buf: list[str] = []
             last_flush_t = time.time()
+
+            # low-latency local thresholds (tidak ubah .env)
+            FLUSH_CHARS = min(128, settings.PARTIAL_FLUSH_CHARS)
+            FLUSH_SECS = min(0.25, settings.PARTIAL_FLUSH_SECONDS)
+
             def on_token(tok: str):
                 nonlocal partial_buf, last_flush_t
-                if not tok: return
+                if not tok:
+                    return
                 partial_buf.append(tok)
                 now = time.time()
-                if sum(len(x) for x in partial_buf) >= settings.PARTIAL_FLUSH_CHARS or (now - last_flush_t) >= settings.PARTIAL_FLUSH_SECONDS:
-                    text = (fstore.get_task(settings.FIRESTORE_COLLECTION, task_id) or {}).get("partial_result","") or ""
-                    text += "".join(partial_buf); partial_buf = []; last_flush_t = now
-                    fstore.set_status(settings.FIRESTORE_COLLECTION, task_id, "processing", {"partial_result": text})
+                should_flush = (
+                    sum(len(x) for x in partial_buf) >= FLUSH_CHARS
+                    or (now - last_flush_t) >= FLUSH_SECS
+                    or tok.endswith((".", "!", "?", "\n"))  # flush di akhir kalimat
+                )
+                if should_flush:
+                    text = (fstore.get_task(settings.FIRESTORE_COLLECTION, task_id) or {}).get("partial_result", "") or ""
+                    text += "".join(partial_buf)
+                    partial_buf = []
+                    last_flush_t = now
+                    fstore.set_status(
+                        settings.FIRESTORE_COLLECTION,
+                        task_id,
+                        "processing",
+                        {"partial_result": text},
+                    )
 
-            final_text, chart_path, _ = run_pipeline(df, user_prompt, charts_dir, stream_compiler=True, on_token=on_token)
+            final_text, chart_path, _ = run_pipeline(
+                df, user_prompt, charts_dir, stream_compiler=True, on_token=on_token
+            )
 
-            if 'partial_buf' in locals() and partial_buf:
-                text = (fstore.get_task(settings.FIRESTORE_COLLECTION, task_id) or {}).get("partial_result","") or ""
+            # flush sisa buffer
+            if partial_buf:
+                text = (fstore.get_task(settings.FIRESTORE_COLLECTION, task_id) or {}).get("partial_result", "") or ""
                 text += "".join(partial_buf)
-                fstore.set_status(settings.FIRESTORE_COLLECTION, task_id, "processing", {"partial_result": text})
+                fstore.set_status(
+                    settings.FIRESTORE_COLLECTION,
+                    task_id,
+                    "processing",
+                    {"partial_result": text},
+                )
         else:
-            final_text, chart_path, _ = run_pipeline(df, user_prompt, charts_dir, stream_compiler=False, on_token=None)
+            final_text, chart_path, _ = run_pipeline(
+                df, user_prompt, charts_dir, stream_compiler=False, on_token=None
+            )
 
         chart_url: Optional[str] = None
         if chart_path and chart_path.exists():
             dest_blob = f"charts/{task_id}.png"
-            gcs.upload_bytes(settings.GCS_BUCKET, dest_blob, chart_path.read_bytes(), content_type="image/png")
+            gcs.upload_bytes(
+                settings.GCS_BUCKET, dest_blob, chart_path.read_bytes(), content_type="image/png"
+            )
             chart_url = f"{settings.API_V1_STR}/chart/{task_id}"
 
         extra = {"result": final_text, "chart_url": chart_url}
