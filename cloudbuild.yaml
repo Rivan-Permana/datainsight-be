@@ -1,9 +1,18 @@
+# cloudbuild.yaml — siap deploy ke Cloud Run (public)
 substitutions:
   _REGION: asia-southeast2
   _SERVICE: csv-analyzer-api
   _REPO: app-images
   _IMAGE: csv-analyzer
   _PROJECT_ID: $PROJECT_ID
+
+  # param yang enak diatur dari satu tempat
+  _CONCURRENCY: "40"
+  _MIN_INSTANCES: "1"
+  _BUCKET: csv-analyzer-bucket-unique
+  _FIRESTORE_COLLECTION: tasks
+  _SERVICE_ACCOUNT: csv-analyzer-run-sa@fitai-news-api-463208.iam.gserviceaccount.com
+  _OPENAI_SECRET: OPENAI_API_KEY
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -23,15 +32,23 @@ steps:
       "--image","${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA",
       "--region","${_REGION}",
       "--platform","managed",
+      "--execution-environment","gen2",
+      "--cpu-boost",
+      "--ingress","all",
       "--allow-unauthenticated",
+
       "--memory","8Gi",
       "--cpu","2",
-      "--no-cpu-throttling",        # <--- tambahkan ini
-      "--concurrency","40",
+      "--no-cpu-throttling",
+      "--concurrency","${_CONCURRENCY}",
       "--timeout","900",
-      "--min-instances","1",
+      "--min-instances","${_MIN_INSTANCES}",
       "--port","8080",
-      "--set-env-vars","GCS_BUCKET=${_SERVICE}-bucket,FIRESTORE_COLLECTION=tasks"
+
+      "--service-account","${_SERVICE_ACCOUNT}",
+
+      "--set-env-vars","ENVIRONMENT=production,LOG_LEVEL=INFO,GCS_BUCKET=${_BUCKET},FIRESTORE_COLLECTION=${_FIRESTORE_COLLECTION}",
+      "--set-secrets","OPENAI_API_KEY=${_OPENAI_SECRET}:latest"
     ]
 
 images:
